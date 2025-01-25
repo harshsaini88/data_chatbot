@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    environment:
+      - MODEL_PATH=/app/models
+      - DATABASE_URL=sqlite:///memory_chatbot.db
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+
+  # Optional database service if needed
+  # database:
+  #   image: postgres:13
+  #   environment:
+  #     POSTGRES_DB: memory_chatbot
+  #     POSTGRES_PASSWORD: your_secure_password
+
+volumes:
+  model_data:
+
+
