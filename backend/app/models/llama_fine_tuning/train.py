@@ -1,69 +1,96 @@
 import torch
-from transformers import LlamaForCausalLM, LlamaTokenizer, Trainer, TrainingArguments
-from datasets import Dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from datasets import load_dataset
+from transformers import TrainingArguments
+from trl import SFTTrainer
 import json
 
-def load_config(config_path='config.json'):
-    with open(config_path, 'r') as f:
-        return json.load(f)
-
-class MemoryImprovementTrainer:
-    def __init__(self, config):
-        self.config = config
-        self.model = LlamaForCausalLM.from_pretrained(config['base_model'])
-        self.tokenizer = LlamaTokenizer.from_pretrained(config['base_model'])
+class QLoRAMemoryTrainer:
+    def __init__(self, config_path='config.json'):
+        # Load configuration
+        with open(config_path, 'r') as f:
+            self.config = json.load(f)
         
-    def prepare_dataset(self, training_data):
-        """Prepare and tokenize dataset for fine-tuning"""
-        dataset = Dataset.from_dict({
-            'input_text': [item['input'] for item in training_data],
-            'target_text': [item['target'] for item in training_data]
-        })
+        # Quantization configuration
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True
+        )
+        
+        # Load base model in 4-bit quantization
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.config['base_model'],
+            quantization_config=quantization_config,
+            device_map="auto"
+        )
+        
+        # Prepare model for training
+        self.model = prepare_model_for_kbit_training(self.model)
+        
+        # LoRA configuration
+        lora_config = LoraConfig(
+            r=self.config['training_config'].get('lora_rank', 16),
+            lora_alpha=self.config['training_config'].get('lora_alpha', 32),
+            target_modules=["q_proj", "v_proj"],
+            lora_dropout=0.1,
+            bias="none",
+            task_type="CAUSAL_LM"
+        )
+        
+        # Apply LoRA
+        self.model = get_peft_model(self.model, lora_config)
+        
+        # Load tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(self.config['base_model'])
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+
+    def prepare_dataset(self, dataset_path):
+        dataset = load_dataset('json', data_files=dataset_path)
         
         def tokenize_function(examples):
-            model_inputs = self.tokenizer(
-                examples['input_text'], 
-                max_length=self.config['training_config']['max_sequence_length'], 
-                truncation=True
+            return self.tokenizer(
+                examples['text'], 
+                truncation=True, 
+                max_length=512, 
+                padding='max_length'
             )
-            with self.tokenizer.as_target_tokenizer():
-                labels = self.tokenizer(
-                    examples['target_text'], 
-                    max_length=self.config['training_config']['max_sequence_length'], 
-                    truncation=True
-                )
-            model_inputs["labels"] = labels["input_ids"]
-            return model_inputs
         
         return dataset.map(tokenize_function, batched=True)
-    
-    def train(self, training_data):
-        processed_dataset = self.prepare_dataset(training_data)
+
+    def train(self, dataset_path):
+        # Prepare dataset
+        train_dataset = self.prepare_dataset(dataset_path)
         
+        # Training arguments
         training_args = TrainingArguments(
-            output_dir='./memory_model_checkpoints',
-            **self.config['training_config']
+            output_dir='./memory_model_qlora',
+            num_train_epochs=self.config['training_config'].get('epochs', 3),
+            per_device_train_batch_size=self.config['training_config'].get('batch_size', 4),
+            learning_rate=self.config['training_config'].get('learning_rate', 2e-4),
+            weight_decay=0.001,
+            fp16=True,
+            logging_dir='./logs'
         )
         
-        trainer = Trainer(
+        # Trainer
+        trainer = SFTTrainer(
             model=self.model,
             args=training_args,
-            train_dataset=processed_dataset
+            train_dataset=train_dataset,
+            dataset_text_field='text'
         )
         
+        # Start training
         trainer.train()
         trainer.save_model()
 
 def main():
-    config = load_config()
-    trainer = MemoryImprovementTrainer(config)
-    
-    # Example training data (replace with your actual data)
-    training_data = [
-        {'input': 'Learn about machine learning', 'target': 'Machine learning is...'}
-    ]
-    
-    trainer.train(training_data)
+    # Ensure you have a dataset prepared
+    trainer = QLoRAMemoryTrainer()
+    trainer.train('memory_dataset.json')
 
 if __name__ == "__main__":
     main()
